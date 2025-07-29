@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <title>ZATCA QR Code Generator</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 1rem;
+      direction: ltr;
+    }
+    [dir="rtl"] {
+      direction: rtl;
+      text-align: right;
+    }
+    button {
+      padding: 0.75rem 1.5rem;
+      font-size: 1rem;
+      background-color: #0078d7;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    .message {
+      margin-top: 1rem;
+      padding: 1rem;
+      background-color: #f0f0f0;
+      border-left: 5px solid #0078d7;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="content">
+    <button id="startBtn">Generate QR Code</button>
+    <div class="message" id="msg" style="display: none;"></div>
+  </div>
+
+  <script>
+    function sendResize () {
+      window.parent.postMessage({ type: "resize", height: document.documentElement.scrollHeight }, "*");
+    }
+
+    async function api(method, path, body) {
+      const requestId = crypto.randomUUID();
+      return new Promise((resolve) => {
+        const handler = (event) => {
+          if (event.source !== window.parent) return;
+          if (event.data?.requestId !== requestId) return;
+          window.removeEventListener("message", handler);
+          resolve(event.data);
+        };
+        window.addEventListener("message", handler);
+        window.parent.postMessage({ type: "api-request", requestId, path, method, body }, "*");
+      });
+    }
+
+    function generateZatcaQrSvg({ sellerName, vatNumber, timestamp, invoiceTotal, vatTotal }) {
+      const encodeTLV = (tag, value) => {
+        const utf8 = new TextEncoder().encode(value);
+        return Uint8Array.from([tag, utf8.length, ...utf8]);
+      };
+
+      const tlv = [
+        encodeTLV(1, sellerName),
+        encodeTLV(2, vatNumber),
+        encodeTLV(3, timestamp),
+        encodeTLV(4, invoiceTotal.toString()),
+        encodeTLV(5, vatTotal.toString())
+      ].reduce((acc, val) => {
+        const combined = new Uint8Array(acc.length + val.length);
+        combined.set(acc);
+        combined.set(val, acc.length);
+        return combined;
+      }, new Uint8Array());
+
+      const base64TLV = btoa(String.fromCharCode(...tlv));
+      const qr = qrcode(0, 'L');
+      qr.addData(base64TLV);
+      qr.make();
+      return qr.createSvgTag({ scalable: true });
+    }
+
+    document.getElementById("startBtn").addEventListener("click", async () => {
+      const msgBox = document.getElementById("msg");
+      msgBox.style.display = "block";
+      msgBox.textContent = "Processing...";
+
+      if (window.parent === window) {
+        msgBox.textContent = "This must run inside Manager.io iframe.";
+        return;
+      }
+
+      window.parent.postMessage({ type: "page-request" }, "*");
+
+      const pageResponse = await new Promise((resolve) => {
+        const handler = (event) => {
+          if (event.source !== window.parent) return;
+          if (event.data?.type !== "page-response") return;
+          window.removeEventListener("message", handler);
+          resolve(event.data);
+        };
+        window.addEventListener("message", handler);
+      });
+
+      if (pageResponse.body?.handler !== "SalesInvoiceView") {
+        msgBox.textContent = "This tool only works on Sales Invoice view.";
+        return;
+      }
+
+      const INVOICE_KEY = pageResponse.body.query.key;
+
+      const customFieldCheck = await api('GET', '/api3/image-custom-field-form/d2e9265a-460e-4a06-83f9-29a523a4d516');
+      if (customFieldCheck.status === 404) {
+        const createField = await api('PUT', '/api3/image-custom-field-form/d2e9265a-460e-4a06-83f9-29a523a4d516', {
+          name: "QR Code",
+          height: 100,
+          width: 100,
+          placement: [
+            "ad12b60b-23bf-4421-94df-8be79cef533e",
+            "245e5943-0092-409d-96ae-e2ee10eac75b"
+          ],
+          displayOnView: true
+        });
+
+        if (createField.status === 401) {
+          msgBox.textContent = "You do not have permission to create custom fields.";
+          return;
+        }
+      }
+
+      const invoice = await api('GET', `/api3/sales-invoice-view/${INVOICE_KEY}`);
+
+      const existingQR = invoice.body.custom_fields?.find(f => f.key === "d2e9265a-460e-4a06-83f9-29a523a4d516")?.text;
+      if (existingQR) {
+        msgBox.textContent = "QR Code is already attached to this invoice.";
+        return;
+      }
+
+      const sellerName = invoice.body.business.name;
+      const vatNumber = invoice.body.business.custom_fields.find(f => f.key === "d96d97e8-c857-42c6-8360-443c06a13de9")?.text || '';
+      const timestamp = new Date().toISOString();
+      const invoiceTotal = invoice.body.table.totals.find(f => f.key === "Total")?.number || 0;
+      const vatTotal = invoice.body.table.totals.filter(t => t.class === "taxAmount").reduce((sum, t) => sum + t.number, 0);
+
+      const svg = generateZatcaQrSvg({ sellerName, vatNumber, timestamp, invoiceTotal, vatTotal });
+      const qrBase64 = btoa(svg);
+
+      const blobResponse = await api('POST', '/api3/blobs', {
+        name: 'QR Code Image',
+        contentType: 'image/svg+xml',
+        content: qrBase64
+      });
+
+      const blobGuid = blobResponse.body;
+
+      const patchResponse = await api('PATCH', `/api3/sales-invoice-form/${INVOICE_KEY}`, {
+        customFields2: {
+          images: {
+            "d2e9265a-460e-4a06-83f9-29a523a4d516": blobGuid
+          }
+        }
+      });
+
+      if (patchResponse.status >= 200 && patchResponse.status < 300) {
+        msgBox.innerHTML = `
+          ✅ QR Code generated and attached successfully.<br>
+          <button onclick="window.parent.postMessage({ type: 'reload' }, '*')">Reload Invoice</button>
+        `;
+      } else {
+        msgBox.textContent = "Failed to attach QR Code.";
+      }
+
+      sendResize();
+    });
+
+    sendResize();
+  </script>
+</body>
+</html>
